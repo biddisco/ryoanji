@@ -131,8 +131,10 @@ struct CombinedUpdate
      *                            resolved, even if the update did not converge.
      * @param[in] counts          node particle counts (including internal nodes), length = tree_.numTreeNodes()
      * @param[in] macs            MAC pass/fail results for each node, length = tree_.numTreeNodes()
+     * @param     scratch         device memory buffer for temporary usage
      * @return                    true if the tree structure did not change
      */
+    template<class Vector>
     static bool updateFocusGpu(OctreeData<KeyType, GpuTag>& tree,
                                DeviceVector<KeyType>& leaves,
                                unsigned bucketSize,
@@ -140,7 +142,8 @@ struct CombinedUpdate
                                KeyType focusEnd,
                                std::span<const KeyType> mandatoryKeys,
                                std::span<const unsigned> counts,
-                               std::span<const uint8_t> macs)
+                               std::span<const uint8_t> macs,
+                               Vector& scratch)
     {
         TreeNodeIndex numNodes = tree.numLeafNodes + tree.numInternalNodes;
         assert(TreeNodeIndex(counts.size()) == numNodes);
@@ -155,10 +158,7 @@ struct CombinedUpdate
 
         auto status = ResolutionStatus::converged;
 
-        DeviceVector<KeyType> d_mandatoryKeys;
-        reallocate(d_mandatoryKeys, mandatoryKeys.size(), 1.0);
-        memcpyH2D(mandatoryKeys.data(), mandatoryKeys.size(), rawPtr(d_mandatoryKeys));
-        status         = enforceKeysGpu(rawPtr(d_mandatoryKeys), d_mandatoryKeys.size(), rawPtr(tree.prefixes),
+        status         = enforceKeysGpu(mandatoryKeys.data(), mandatoryKeys.size(), rawPtr(tree.prefixes),
                                         rawPtr(tree.childOffsets), rawPtr(tree.parents), nodeOpsAll.data());
         bool converged = protectAncestorsGpu(rawPtr(tree.prefixes), rawPtr(tree.parents), nodeOpsAll.data(), numNodes);
 
@@ -186,12 +186,23 @@ struct CombinedUpdate
         if (status == ResolutionStatus::failed)
         {
             converged = false;
-            injectKeysGpu(leaves, {d_mandatoryKeys.data(), d_mandatoryKeys.size()}, tree.prefixes, tree.childOffsets,
+            injectKeysGpu(leaves, {mandatoryKeys.data(), mandatoryKeys.size()}, tree.prefixes, tree.childOffsets,
                           tree.internalToLeaf);
         }
 
         tree.resize(nNodes(leaves));
-        buildOctreeGpu(rawPtr(leaves), tree.data());
+
+        std::size_t newNumNodes        = tree.numNodes;
+        std::size_t spaceForLevelRange = sizeof(TreeNodeIndex) * (maxTreeLevel<KeyType>{} + 2);
+        std::size_t cubTmpSize =
+            std::max(sortByKeyTempStorage<KeyType, TreeNodeIndex>(newNumNodes), spaceForLevelRange);
+
+        auto originalSize               = scratch.size();
+        auto [keyBuf, valueBuf, cubTmp] = util::packAllocBuffer(scratch, util::TypeList<KeyType, TreeNodeIndex, char>{},
+                                                                {newNumNodes, newNumNodes, cubTmpSize}, 128);
+
+        buildOctreeGpu(rawPtr(leaves), tree.data(), keyBuf, valueBuf, cubTmp);
+        scratch.resize(originalSize);
 
         return converged;
     }
@@ -378,7 +389,7 @@ public:
 
         counts_.resize(tree_.numNodes);
         scatter(leafToInternal(tree_), leafCounts_.data(), counts_.data());
-        upsweep(tree_.levelRange, tree_.childOffsets, counts_.data(), NodeCount<unsigned>{});
+        upsweep(tree_.levelRange, tree_.childOffsets.data(), counts_.data(), NodeCount<unsigned>{});
 
         return converged;
     }
