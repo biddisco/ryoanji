@@ -51,11 +51,13 @@ class GlobalAssignment
     constexpr static bool gpu = HaveGpu<Accelerator>{};
 
 public:
-    GlobalAssignment(int rank, int nRanks, unsigned bucketSize, const Box<T>& box)
+    GlobalAssignment(int rank, int nRanks, unsigned bucketSize, const Box<T>& box,
+                     MPI_Comm comm)
         : myRank_(rank)
         , numRanks_(nRanks)
         , bucketSize_(bucketSize)
         , box_(box)
+        , comm_(comm)
     {
         unsigned level         = log8ceil<KeyType>(100 * nRanks);
         auto initialBoundaries = initialDomainSplits<KeyType>(nRanks, level);
@@ -69,9 +71,6 @@ public:
             d_csTree_     = leaves_;
             d_nodeCounts_ = nodeCounts_;
             buildOctreeGpu(d_csTree_.data(), tree_.data());
-
-            hostTree_.resize(nNodes(leaves_));
-            updateInternalTree<KeyType>(leaves_, hostTree_.data());
         }
         else { updateInternalTree<KeyType>(leaves_, tree_.data()); }
     }
@@ -104,7 +103,7 @@ public:
         LocalIndex numPart = o1.end - o1.start;
 
         using Op        = std::conditional_t<HaveGpu<Accelerator>{}, MinMaxGpu<T>, MinMax<T>>;
-        auto fittingBox = makeGlobalBox<T, Op>(x + o1.start, y + o1.start, z + o1.start, numPart, box_);
+        auto fittingBox = makeGlobalBox<T, Op>(x + o1.start, y + o1.start, z + o1.start, numPart, comm_, box_);
         if (firstCall_) { box_ = fittingBox; }
         else { box_ = limitBoxShrinking(fittingBox, box_); }
 
@@ -114,26 +113,25 @@ public:
         sequence<gpu>(o1.start, numPart, reorderFunctor.getBuf(), growthRate_);
         sortByKey<gpu>(keyView, std::span{reorderFunctor.getMap() + o1.start, keyView.size()}, s0, s1, growthRate_);
 
-        updateOctreeGlobal<KeyType>(keyView, bucketSize_, tree_, leaves_, d_csTree_, nodeCounts_, d_nodeCounts_);
-        if (firstCall_)
+        auto maxCount = updateOctreeGlobal<KeyType>(keyView, bucketSize_, tree_, leaves_, d_csTree_, nodeCounts_,
+                                                    d_nodeCounts_, false, comm_);
+        if (firstCall_ || maxCount >= 8 * bucketSize_)
         {
             firstCall_ = false;
-            while (!updateOctreeGlobal<KeyType>(keyView, bucketSize_, tree_, leaves_, d_csTree_, nodeCounts_,
-                                                d_nodeCounts_))
+            while (updateOctreeGlobal<KeyType>(keyView, bucketSize_, tree_, leaves_, d_csTree_, nodeCounts_,
+                                               d_nodeCounts_, true, comm_) > bucketSize_)
                 ;
         }
 
         if constexpr (gpu)
         {
-            hostTree_.resize(tree_.numLeafNodes);
-            memcpyD2H(tree_.prefixes.data(), tree_.prefixes.size(), hostTree_.prefixes.data());
-            memcpyD2H(tree_.childOffsets.data(), tree_.childOffsets.size(), hostTree_.childOffsets.data());
-            std::copy_n(tree_.levelRange.data(), tree_.levelRange.size(), hostTree_.levelRange.data());
+            reallocate(leaves_, d_csTree_.size(), growthRate_);
+            reallocate(nodeCounts_, d_nodeCounts_.size(), growthRate_);
+            memcpyD2H(d_csTree_.data(), d_csTree_.size(), leaves_.data());
+            memcpyD2H(d_nodeCounts_.data(), d_nodeCounts_.size(), nodeCounts_.data());
         }
 
-        auto newAssignment = makeSfcAssignment(numRanks_, nodeCounts_, leaves_.data());
-        limitBoundaryShifts<KeyType>(assignment_, newAssignment, leaves_, nodeCounts_);
-        assignment_ = std::move(newAssignment);
+        assignment_ = makeSfcAssignment(numRanks_, nodeCounts_, leaves_.data());
 
         if constexpr (gpu)
         {
@@ -184,12 +182,12 @@ public:
         if constexpr (gpu)
         {
             exchangeParticlesGpu(0, recvLog_, exchanges_, myRank_, recvStart, recvStart + numRecv, s0, s1,
-                                 reorderFunctor.getMap() + o1e.start, x, y, z, properties...);
+                                 reorderFunctor.getMap() + o1e.start, comm_, x, y, z, properties...);
         }
         else
         {
             exchangeParticles(0, recvLog_, exchanges_, myRank_, recvStart, recvStart + numRecv,
-                              reorderFunctor.getMap() + o1e.start, x, y, z, properties...);
+                              reorderFunctor.getMap() + o1e.start, comm_, x, y, z, properties...);
         }
 
         auto [newStart, newEnd] = domain_exchange::assignedEnvelope(o1e, numAssigned() - numPresent());
@@ -212,7 +210,8 @@ public:
         auto numRecv    = numAssigned() - numPresent();
         auto recvStart  = domain_exchange::receiveStart(o1e, numRecv);
         auto exchangeO2 = shiftSendRanges(exchanges_, myRank_, numRecv);
-        exchangeParticles(1, recvLog_, exchangeO2, myRank_, recvStart, recvStart + numRecv, ordering, properties...);
+        exchangeParticles(1, recvLog_, exchangeO2, myRank_, recvStart, recvStart + numRecv, ordering, comm_,
+                          properties...);
     }
 
     //! @brief read only visibility of the global octree leaves to the outside
@@ -229,26 +228,12 @@ public:
         else { return nodeCounts_; }
     }
 
-    /*! @brief the octree, internal part and leaves
-     *
-     * All data is on the host, except treeData.leaves which is on the GPU if gpu == true
-     */
+    //! @brief the octree, internal part and leaves. All data is on the GPU, when gpu == true
     OctreeView<const KeyType> octree() const
     {
         auto treeData   = tree_.cdata();
         treeData.leaves = treeLeaves().data();
         return treeData;
-    }
-
-    OctreeView<const KeyType> octreeHost() const
-    {
-        if constexpr (gpu)
-        {
-            auto treeData   = hostTree_.cdata();
-            treeData.leaves = leaves_.data();
-            return treeData;
-        }
-        else { return octree(); }
     }
 
     //! @brief the global coordinate bounding box
@@ -278,6 +263,8 @@ private:
     //! @brief global coordinate bounding box
     Box<T> box_;
 
+    MPI_Comm comm_;
+
     SfcAssignment<KeyType> assignment_;
     SendRanges exchanges_;
     mutable ExchangeLog recvLog_;
@@ -291,7 +278,6 @@ private:
 
     //! @brief the fully linked octree
     OctreeData<KeyType, Accelerator> tree_;
-    OctreeData<KeyType, CpuTag> hostTree_;
     std::vector<KeyType> leaves_;
     AccVector<KeyType> d_csTree_;
 
